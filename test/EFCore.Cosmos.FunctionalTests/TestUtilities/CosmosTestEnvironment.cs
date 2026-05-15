@@ -10,7 +10,7 @@ namespace Microsoft.EntityFrameworkCore.TestUtilities;
 
 #nullable disable
 
-public static class TestEnvironment
+public static class CosmosTestEnvironment
 {
     private static readonly string _emulatorAuthToken =
         "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==";
@@ -165,4 +165,12 @@ public static class TestEnvironment
 
     public static bool IsLinuxEmulator => IsEmulator
         && EmulatorType.Equals("linux", StringComparison.OrdinalIgnoreCase);
+
+    public static bool IsAvailable => CosmosTestStore.IsConnectionAvailableAsync().AsTask().GetAwaiter().GetResult();
+
+    // ---- Conditional* helpers consumed by [ConditionalFact(typeof(TestEnvironment), nameof(...))] ----
+
+    public static bool DoesNotUseTokenCredential => !UseTokenCredential;
+    public static bool IsNotEmulator => !IsEmulator;
+    public static bool IsNotLinuxEmulator => !IsLinuxEmulator;
 }
