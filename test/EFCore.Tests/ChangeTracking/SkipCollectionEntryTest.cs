@@ -365,10 +365,10 @@ public class SkipCollectionEntryTest
         cherry1.Chunkies.Add(chunky2);
         context.ChangeTracker.DetectChanges();
 
-        Assert.True(relatedToCherry1.IsModified);
+        Assert.False(relatedToCherry1.IsModified);
         Assert.False(relatedToCherry2.IsModified);
         Assert.False(relatedToChunky1.IsModified);
-        Assert.True(relatedToChunky2.IsModified);
+        Assert.False(relatedToChunky2.IsModified);
     }
 
     [Theory, InlineData(false), InlineData(true)]

@@ -379,8 +379,20 @@ public class NavigationFixer : INavigationFixer
                 {
                     if (navigationBase is ISkipNavigation skipNavigation)
                     {
-                        FindOrCreateJoinEntry(
+                        var joinEntry = FindOrCreateJoinEntry(
                             (entry, newTargetEntry, skipNavigation, FromQuery: false, SetModified: true));
+
+                        // Restore a join entity that was deleted when the same entity was removed from the collection
+                        if (joinEntry?.EntityState == EntityState.Deleted
+                            && entry.EntityState is EntityState.Unchanged or EntityState.Modified
+                            && newTargetEntry.EntityState is EntityState.Unchanged or EntityState.Modified)
+                        {
+                            // Properties marked as modified before the join entity was deleted are kept; as for any
+                            // Deleted entity, changes made while it was Deleted are not tracked
+                            joinEntry.SetEntityState(
+                                joinEntry.HasModifiedProperties ? EntityState.Modified : EntityState.Unchanged,
+                                modifyProperties: false);
+                        }
 
                         Check.DebugAssert(
                             skipNavigation.Inverse.IsCollection,
@@ -1157,7 +1169,7 @@ public class NavigationFixer : INavigationFixer
         }
     }
 
-    private void FindOrCreateJoinEntry(
+    private InternalEntityEntry? FindOrCreateJoinEntry(
         (InternalEntityEntry Entry,
             InternalEntityEntry OtherEntry,
             ISkipNavigation SkipNavigation,
@@ -1204,6 +1216,8 @@ public class NavigationFixer : INavigationFixer
 
             _danglingJoinEntities.Add(arguments);
         }
+
+        return joinEntry;
     }
 
     private static InternalEntityEntry? FindJoinEntry(

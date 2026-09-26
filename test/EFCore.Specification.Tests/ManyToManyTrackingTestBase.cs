@@ -5622,6 +5622,154 @@ public abstract partial class ManyToManyTrackingTestBase<TFixture>(TFixture fixt
         }
     }
 
+    [Theory, InlineData(false, false, false), InlineData(false, true, false), InlineData(false, false, true),
+     InlineData(false, true, true), InlineData(true, false, false), InlineData(true, true, false), InlineData(true, false, true),
+     InlineData(true, true, true)]
+    public virtual Task Can_remove_and_add_back_an_existing_relationship(bool clear, bool modifyLeft, bool modifyRight)
+        => RemoveAndAddBackExistingRelationship<EntityOne, EntityTwo, JoinOneToTwo>(
+            e => e.TwoSkip, e => e.Id, e => e.Id, clear, modifyLeft, modifyRight);
+
+    [Theory, InlineData(false, false, false), InlineData(false, true, false), InlineData(false, false, true),
+     InlineData(false, true, true), InlineData(true, false, false), InlineData(true, true, false), InlineData(true, false, true),
+     InlineData(true, true, true)]
+    public virtual Task Can_remove_and_add_back_an_existing_relationship_shared(bool clear, bool modifyLeft, bool modifyRight)
+        => RemoveAndAddBackExistingRelationship<EntityOne, EntityTwo, Dictionary<string, object>>(
+            e => e.TwoSkipShared, e => e.Id, e => e.Id, clear, modifyLeft, modifyRight);
+
+    [Theory, InlineData(false, false, false), InlineData(false, true, false), InlineData(false, false, true),
+     InlineData(false, true, true), InlineData(true, false, false), InlineData(true, true, false), InlineData(true, false, true),
+     InlineData(true, true, true)]
+    public virtual Task Can_remove_and_add_back_an_existing_relationship_with_payload(bool clear, bool modifyLeft, bool modifyRight)
+        => RemoveAndAddBackExistingRelationship<EntityOne, EntityThree, JoinOneToThreePayloadFull>(
+            e => e.ThreeSkipPayloadFull, e => e.Id, e => e.Id, clear, modifyLeft, modifyRight,
+            (context, left, right) => FindJoin(context, left, right).Payload = "Changed",
+            (context, left, right, reloaded) =>
+            {
+                var joinEntry = context.Entry(FindJoin(context, left, right));
+
+                Assert.Equal("Changed", joinEntry.Entity.Payload);
+                Assert.Equal(reloaded ? EntityState.Unchanged : EntityState.Modified, joinEntry.State);
+                Assert.Equal(!reloaded, joinEntry.Property(e => e.Payload).IsModified);
+            });
+
+    [Theory, InlineData(false, false, false), InlineData(false, true, false), InlineData(false, false, true),
+     InlineData(false, true, true), InlineData(true, false, false), InlineData(true, true, false), InlineData(true, false, true),
+     InlineData(true, true, true)]
+    public virtual Task Can_remove_and_add_back_an_existing_relationship_composite_with_navs(
+        bool clear,
+        bool modifyLeft,
+        bool modifyRight)
+        => RemoveAndAddBackExistingRelationship<EntityCompositeKey, EntityThree, JoinThreeToCompositeKeyFull>(
+            e => e.ThreeSkipFull, e => (e.Key1, e.Key2, e.Key3), e => e.Id, clear, modifyLeft, modifyRight);
+
+    private static JoinOneToThreePayloadFull FindJoin(ManyToManyContext context, EntityOne left, EntityThree right)
+        => context.ChangeTracker.Entries<JoinOneToThreePayloadFull>()
+            .Single(e => e.Entity.OneId == left.Id && e.Entity.ThreeId == right.Id).Entity;
+
+    private Task RemoveAndAddBackExistingRelationship<TLeft, TRight, TJoin>(
+        Expression<Func<TLeft, ICollection<TRight>>> navigation,
+        Func<TLeft, object> getLeftKey,
+        Func<TRight, int> getRightKey,
+        bool clear,
+        bool modifyLeft,
+        bool modifyRight,
+        Action<ManyToManyContext, TLeft, TRight>? changeJoin = null,
+        Action<ManyToManyContext, TLeft, TRight, bool>? verifyJoin = null)
+        where TLeft : class
+        where TRight : class
+        where TJoin : class
+    {
+        var getCollection = navigation.Compile();
+        object leftKey = null!;
+        List<int> rightKeys = null!;
+        var changedRightKey = -1;
+
+        return ExecuteWithStrategyInTransactionAsync(
+            async context =>
+            {
+                var left = (await context.Set<TLeft>().Include(navigation).ToListAsync())
+                    .OrderBy(getLeftKey)
+                    .First(e => getCollection(e).Count > 1);
+
+                var collection = getCollection(left);
+                leftKey = getLeftKey(left);
+                rightKeys = collection.Select(getRightKey).OrderBy(e => e).ToList();
+
+                var removed = clear ? collection.ToList() : [collection.First()];
+                changedRightKey = getRightKey(removed[0]);
+
+                if (modifyLeft)
+                {
+                    context.Entry(left).State = EntityState.Modified;
+                }
+
+                if (modifyRight)
+                {
+                    foreach (var right in removed)
+                    {
+                        context.Entry(right).State = EntityState.Modified;
+                    }
+                }
+
+                changeJoin?.Invoke(context, left, removed[0]);
+
+                if (clear)
+                {
+                    collection.Clear();
+                }
+                else
+                {
+                    collection.Remove(removed[0]);
+                }
+
+                if (RequiresDetectChanges)
+                {
+                    context.ChangeTracker.DetectChanges();
+                }
+
+                Assert.Equal(removed.Count, context.ChangeTracker.Entries<TJoin>().Count(e => e.State == EntityState.Deleted));
+
+                foreach (var right in removed)
+                {
+                    collection.Add(right);
+                }
+
+                if (RequiresDetectChanges)
+                {
+                    context.ChangeTracker.DetectChanges();
+
+                    // Detects changes made to the restored join entity before it was removed, as SaveChanges would
+                    context.ChangeTracker.DetectChanges();
+                }
+
+                Assert.Equal(rightKeys, collection.Select(getRightKey).OrderBy(e => e));
+
+                var changedJoinEntries = context.ChangeTracker.Entries<TJoin>().Where(e => e.State != EntityState.Unchanged).ToList();
+                Assert.Equal(changeJoin == null ? 0 : 1, changedJoinEntries.Count);
+                Assert.All(changedJoinEntries, e => Assert.Equal(EntityState.Modified, e.State));
+
+                verifyJoin?.Invoke(context, left, removed[0], false);
+
+                Assert.Equal(modifyLeft ? EntityState.Modified : EntityState.Unchanged, context.Entry(left).State);
+                Assert.All(
+                    removed, e => Assert.Equal(modifyRight ? EntityState.Modified : EntityState.Unchanged, context.Entry(e).State));
+
+                VerifyRelationshipSnapshots(context, [left]);
+                VerifyRelationshipSnapshots(context, removed);
+
+                await context.SaveChangesAsync();
+            }, async context =>
+            {
+                var left = (await context.Set<TLeft>().Include(navigation).ToListAsync())
+                    .Single(e => getLeftKey(e).Equals(leftKey));
+
+                var collection = getCollection(left);
+                Assert.Equal(rightKeys, collection.Select(getRightKey).OrderBy(e => e));
+
+                verifyJoin?.Invoke(context, left, collection.Single(e => getRightKey(e) == changedRightKey), true);
+            });
+    }
+
     protected static void VerifyRelationshipSnapshots(DbContext context, IEnumerable<object> entities)
     {
         var detectChanges = context.ChangeTracker.AutoDetectChangesEnabled;

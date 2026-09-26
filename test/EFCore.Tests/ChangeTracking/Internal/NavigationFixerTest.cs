@@ -2,6 +2,8 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Collections;
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
 using Microsoft.EntityFrameworkCore.Storage.Json;
 
 // ReSharper disable UnusedMember.Local
@@ -1268,8 +1270,252 @@ public class NavigationFixerTest
         Assert.Equal(dependent2.AlternateProductId, principal2.Id);
     }
 
+    [Fact]
+    public void Removing_and_adding_back_skip_navigation_items_with_notifications_restores_join_entities()
+    {
+        using var context = new NotifyingManyToManyContext();
+        var left = new NotifyingLeft { Id = 1 };
+        var right1 = new NotifyingRight { Id = 1 };
+        var right2 = new NotifyingRight { Id = 2 };
+        left.Rights.Add(right1);
+        left.Rights.Add(right2);
+
+        context.Attach(left);
+
+        var joinEntries = context.ChangeTracker.Entries<Dictionary<string, object>>().ToList();
+        Assert.Equal(2, joinEntries.Count);
+        Assert.All(joinEntries, e => Assert.Equal(EntityState.Unchanged, e.State));
+
+        left.Rights.Clear();
+
+        Assert.Empty(right1.Lefts);
+        Assert.Empty(right2.Lefts);
+        Assert.All(joinEntries, e => Assert.Equal(EntityState.Deleted, e.State));
+
+        var stateChanges = new List<(object Entity, EntityState OldState, EntityState NewState)>();
+        context.ChangeTracker.StateChanged += (_, a) => stateChanges.Add((a.Entry.Entity, a.OldState, a.NewState));
+
+        left.Rights.Add(right1);
+        right2.Lefts.Add(left);
+
+        Assert.Equal([right1, right2], left.Rights.OrderBy(e => e.Id));
+        Assert.Same(left, right1.Lefts.Single());
+        Assert.Same(left, right2.Lefts.Single());
+        Assert.Equal(2, context.ChangeTracker.Entries<Dictionary<string, object>>().Count());
+        Assert.All(joinEntries, e => Assert.Equal(EntityState.Unchanged, e.State));
+        Assert.Equal(
+            joinEntries.Select(e => ((object)e.Entity, EntityState.Deleted, EntityState.Unchanged)).ToList(),
+            stateChanges.OrderBy(c => c.Entity == joinEntries[0].Entity ? 0 : 1).ToList());
+    }
+
+    [Theory, InlineData(false), InlineData(true)]
+    public void Adding_back_skip_navigation_item_does_not_restore_join_entity_when_an_end_is_deleted(bool deleteCollectionOwner)
+    {
+        using var context = new NotifyingManyToManyContext();
+        var left = new NotifyingLeft { Id = 1 };
+        var right = new NotifyingRight { Id = 1 };
+        left.Rights.Add(right);
+
+        context.Attach(left);
+
+        var joinEntry = context.ChangeTracker.Entries<Dictionary<string, object>>().Single();
+
+        var deletedEntity = deleteCollectionOwner ? (object)left : right;
+        context.Entry(deletedEntity).State = EntityState.Deleted;
+        left.Rights.Remove(right);
+
+        Assert.Equal(EntityState.Deleted, joinEntry.State);
+
+        left.Rights.Add(right);
+
+        Assert.Equal(EntityState.Deleted, context.Entry(deletedEntity).State);
+        Assert.Equal(EntityState.Deleted, joinEntry.State);
+    }
+
+    [Fact]
+    public void Removing_and_adding_back_skip_navigation_item_with_notifications_keeps_join_payload_changes()
+    {
+        using var context = new NotifyingManyToManyContext();
+        var left = new NotifyingLeft { Id = 1 };
+        var right = new NotifyingRight { Id = 1 };
+        left.PayloadRights.Add(right);
+
+        context.Attach(left);
+
+        var joinEntry = context.ChangeTracker.Entries<NotifyingPayloadJoin>().Single();
+        Assert.Equal(EntityState.Unchanged, joinEntry.State);
+
+        joinEntry.Entity.Payload = "Changed";
+
+        Assert.Equal(EntityState.Modified, joinEntry.State);
+        Assert.True(joinEntry.Property(e => e.Payload).IsModified);
+
+        left.PayloadRights.Remove(right);
+
+        Assert.Equal(EntityState.Deleted, joinEntry.State);
+
+        left.PayloadRights.Add(right);
+
+        Assert.Same(joinEntry.Entity, context.ChangeTracker.Entries<NotifyingPayloadJoin>().Single().Entity);
+        Assert.Equal(EntityState.Modified, joinEntry.State);
+        Assert.True(joinEntry.Property(e => e.Payload).IsModified);
+        Assert.False(joinEntry.Property(e => e.LeftId).IsModified);
+        Assert.False(joinEntry.Property(e => e.RightId).IsModified);
+        Assert.Equal("Changed", joinEntry.Entity.Payload);
+    }
+
+    [Fact]
+    public void Removing_and_adding_back_skip_navigation_item_does_not_revert_join_complex_property_changes()
+    {
+        using var context = new NotifyingManyToManyContext();
+        var left = new NotifyingLeft { Id = 1 };
+        var right = new NotifyingRight { Id = 1 };
+        left.ComplexRights.Add(right);
+
+        context.Attach(left);
+
+        var joinEntry = context.ChangeTracker.Entries<ComplexPayloadJoin>().Single();
+        Assert.Equal(EntityState.Unchanged, joinEntry.State);
+
+        joinEntry.Entity.Details.Note = "Changed";
+
+        left.ComplexRights.Remove(right);
+
+        Assert.Equal(EntityState.Deleted, joinEntry.State);
+
+        left.ComplexRights.Add(right);
+
+        Assert.Equal(EntityState.Unchanged, joinEntry.State);
+        Assert.Equal("Changed", joinEntry.Entity.Details.Note);
+
+        context.ChangeTracker.DetectChanges();
+
+        Assert.Equal(EntityState.Modified, joinEntry.State);
+        Assert.True(joinEntry.ComplexProperty(e => e.Details).Property(e => e.Note).IsModified);
+        Assert.Equal("Changed", joinEntry.Entity.Details.Note);
+    }
+
     private static IServiceProvider CreateContextServices(IModel? model = null)
         => InMemoryTestHelpers.Instance.CreateContextServices(model ?? BuildModel());
+
+    private class NotifyingManyToManyContext : DbContext
+    {
+        protected internal override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
+            => optionsBuilder
+                .UseInternalServiceProvider(InMemoryFixture.DefaultServiceProvider)
+                .UseInMemoryDatabase(typeof(NotifyingManyToManyContext).FullName!);
+
+        protected internal override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.HasChangeTrackingStrategy(ChangeTrackingStrategy.ChangingAndChangedNotifications);
+
+            modelBuilder.Entity<NotifyingLeft>(b =>
+            {
+                b.HasMany(e => e.Rights)
+                    .WithMany(e => e.Lefts)
+                    .UsingEntity(j => j.HasChangeTrackingStrategy(ChangeTrackingStrategy.Snapshot));
+
+                b.HasMany(e => e.PayloadRights)
+                    .WithMany(e => e.PayloadLefts)
+                    .UsingEntity<NotifyingPayloadJoin>(
+                        r => r.HasOne<NotifyingRight>().WithMany().HasForeignKey(e => e.RightId),
+                        l => l.HasOne<NotifyingLeft>().WithMany().HasForeignKey(e => e.LeftId))
+                    .HasKey(e => new { e.LeftId, e.RightId });
+
+                b.HasMany(e => e.ComplexRights)
+                    .WithMany(e => e.ComplexLefts)
+                    .UsingEntity<ComplexPayloadJoin>(
+                        r => r.HasOne<NotifyingRight>().WithMany().HasForeignKey(e => e.RightId),
+                        l => l.HasOne<NotifyingLeft>().WithMany().HasForeignKey(e => e.LeftId),
+                        j =>
+                        {
+                            j.HasChangeTrackingStrategy(ChangeTrackingStrategy.Snapshot);
+                            j.HasKey(e => new { e.LeftId, e.RightId });
+                            j.ComplexProperty(e => e.Details).HasChangeTrackingStrategy(ChangeTrackingStrategy.Snapshot);
+                        });
+            });
+        }
+    }
+
+    private class NotifyingLeft : NotifyingEntity
+    {
+        private int _id;
+
+        public int Id
+        {
+            get => _id;
+            set => SetWithNotify(value, ref _id);
+        }
+
+        public ObservableHashSet<NotifyingRight> Rights { get; } = [];
+        public ObservableHashSet<NotifyingRight> PayloadRights { get; } = [];
+        public ObservableHashSet<NotifyingRight> ComplexRights { get; } = [];
+    }
+
+    private class NotifyingRight : NotifyingEntity
+    {
+        private int _id;
+
+        public int Id
+        {
+            get => _id;
+            set => SetWithNotify(value, ref _id);
+        }
+
+        public ObservableHashSet<NotifyingLeft> Lefts { get; } = [];
+        public ObservableHashSet<NotifyingLeft> PayloadLefts { get; } = [];
+        public ObservableHashSet<NotifyingLeft> ComplexLefts { get; } = [];
+    }
+
+    private class ComplexPayloadJoin
+    {
+        public int LeftId { get; set; }
+        public int RightId { get; set; }
+        public JoinDetails Details { get; set; } = new();
+    }
+
+    private class JoinDetails
+    {
+        public string? Note { get; set; }
+    }
+
+    private class NotifyingPayloadJoin : NotifyingEntity
+    {
+        private int _leftId;
+        private int _rightId;
+        private string? _payload;
+
+        public int LeftId
+        {
+            get => _leftId;
+            set => SetWithNotify(value, ref _leftId);
+        }
+
+        public int RightId
+        {
+            get => _rightId;
+            set => SetWithNotify(value, ref _rightId);
+        }
+
+        public string? Payload
+        {
+            get => _payload;
+            set => SetWithNotify(value, ref _payload);
+        }
+    }
+
+    private class NotifyingEntity : INotifyPropertyChanging, INotifyPropertyChanged
+    {
+        protected void SetWithNotify<T>(T value, ref T field, [CallerMemberName] string propertyName = "")
+        {
+            PropertyChanging?.Invoke(this, new PropertyChangingEventArgs(propertyName));
+            field = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+        }
+
+        public event PropertyChangingEventHandler? PropertyChanging;
+        public event PropertyChangedEventHandler? PropertyChanged;
+    }
 
     private class Category
     {
